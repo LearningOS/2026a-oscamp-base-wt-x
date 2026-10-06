@@ -27,6 +27,8 @@ pub struct SpinGuard<'a, T> {
     lock: &'a SpinLock<T>,
 }
 
+unsafe impl<T: Sync> Sync for SpinGuard<'_, T> {}
+
 impl<T> SpinLock<T> {
     pub fn new(data: T) -> Self {
         Self {
@@ -37,37 +39,39 @@ impl<T> SpinLock<T> {
 
     /// Acquire lock, returning SpinGuard.
     ///
-    /// TODO: Spin-wait to acquire lock (compare_exchange), return SpinGuard on success.
+    /// Implementation: Spin-wait to acquire lock (compare_exchange), return SpinGuard on success.
     pub fn lock(&self) -> SpinGuard<'_, T> {
-        // TODO: Spin-wait to acquire lock
-        // TODO: Return SpinGuard { lock: self }
-        todo!()
+        while self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        SpinGuard { lock: self }
     }
 }
 
-// TODO: Implement Deref trait for SpinGuard
 // Return &T, obtained via self.lock.data.get()
 impl<T> Deref for SpinGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        unsafe { &*self.lock.data.get() }
     }
 }
 
-// TODO: Implement DerefMut trait for SpinGuard
 // Return &mut T
 impl<T> DerefMut for SpinGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        todo!()
+        unsafe { &mut *self.lock.data.get() }
     }
 }
 
-// TODO: Implement Drop trait for SpinGuard
 // Set lock.locked to false (Release ordering)
 impl<T> Drop for SpinGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        self.lock.locked.store(false, Ordering::Release);
     }
 }
 
@@ -148,6 +152,7 @@ mod tests {
 
         assert!(result.is_err());
         // Even if thread panics, guard's Drop should release lock
-        // Note: this test may have different results due to panic unwind behavior
+        let guard = lock.lock();
+        assert_eq!(*guard, 42);
     }
 }

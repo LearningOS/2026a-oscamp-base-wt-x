@@ -137,7 +137,19 @@ impl Scheduler {
     ///    `sp` must be 16-byte aligned (e.g. `(stack_top - 16) & !15` to leave headroom).
     /// 3. Push a `GreenThread` with this context, state `Ready`, and `entry` stored for the wrapper to call.
     pub fn spawn(&mut self, entry: extern "C" fn()) {
-        todo!("alloc stack, init ctx with ra=thread_wrapper and aligned sp, push GreenThread(Ready, entry)")
+        let stack = vec![0u8; STACK_SIZE];
+        let top = stack.as_ptr() as usize + stack.len();
+        let ctx = TaskContext {
+            sp: ((top - 16) & !15) as u64,
+            ra: thread_wrapper as *const () as u64,
+            ..TaskContext::default()
+        };
+        self.threads.push(GreenThread {
+            ctx,
+            state: ThreadState::Ready,
+            _stack: Some(stack),
+            entry: Some(entry),
+        });
     }
 
     /// Run the scheduler until all threads (except the main one) are `Finished`.
@@ -146,12 +158,48 @@ impl Scheduler {
     /// 2. Loop: if all threads in `threads[1..]` are `Finished`, break; otherwise call `schedule_next()` (which may switch away and later return).
     /// 3. Clear `SCHEDULER` when done.
     pub fn run(&mut self) {
-        todo!("set SCHEDULER to self, loop until threads[1..] all Finished, call schedule_next, then clear SCHEDULER")
+        unsafe {
+            SCHEDULER = self as *mut Self;
+        }
+        while self
+            .threads
+            .iter()
+            .skip(1)
+            .any(|thread| thread.state != ThreadState::Finished)
+        {
+            self.schedule_next();
+        }
+        unsafe {
+            SCHEDULER = std::ptr::null_mut();
+            CURRENT_THREAD_ENTRY = None;
+        }
     }
 
     /// Find the next ready thread (starting from `current + 1` round-robin), mark current as `Ready` (if not `Finished`), mark next as `Running`, set `CURRENT_THREAD_ENTRY` if the next thread has an entry, then switch to it.
     fn schedule_next(&mut self) {
-        todo!("round-robin find next Ready, set current Ready (if not Finished), next Running, CURRENT_THREAD_ENTRY, then switch_context")
+        let old = self.current;
+        let next = (1..self.threads.len())
+            .map(|offset| (old + offset) % self.threads.len())
+            .find(|&id| self.threads[id].state == ThreadState::Ready);
+        let Some(next) = next else {
+            return;
+        };
+        if self.threads[old].state != ThreadState::Finished {
+            self.threads[old].state = ThreadState::Ready;
+        }
+        self.threads[next].state = ThreadState::Running;
+        self.current = next;
+        if let Some(entry) = self.threads[next].entry.take() {
+            unsafe {
+                CURRENT_THREAD_ENTRY = Some(entry);
+            }
+        }
+        // Form pointers only after updating the vector; it stays allocated during the switch.
+        let old_context = self.threads[old].ctx.as_mut_ptr();
+        let new_context = self.threads[next].ctx.as_ptr();
+        unsafe {
+            switch_context(&mut *old_context, &*new_context);
+        }
     }
 }
 
@@ -246,5 +294,19 @@ mod tests {
         sched.run();
 
         assert_eq!(SIMPLE_FLAG.load(Ordering::SeqCst), 42);
+    }
+
+    #[test]
+    fn test_empty_scheduler_and_reuse() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let mut scheduler = Scheduler::new();
+        scheduler.run();
+        yield_now();
+        for _ in 0..2 {
+            SIMPLE_FLAG.store(0, Ordering::SeqCst);
+            scheduler.spawn(simple_task);
+            scheduler.run();
+            assert_eq!(SIMPLE_FLAG.load(Ordering::SeqCst), 42);
+        }
     }
 }

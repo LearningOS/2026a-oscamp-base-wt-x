@@ -63,18 +63,28 @@ impl BumpAllocator {
 
 unsafe impl GlobalAlloc for BumpAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // TODO: Implement bump allocation
-        //
-        // Steps:
-        // 1. Load current next (use Ordering::SeqCst)
-        // 2. Align next up to layout.align()
-        //    Hint: align_up(addr, align) = (addr + align - 1) & !(align - 1)
-        // 3. Compute allocation end = aligned + layout.size()
-        // 4. If end > heap_end, return null_mut()
-        // 5. Atomically update next to end using compare_exchange
-        //    (if CAS fails, another thread raced — retry in a loop)
-        // 6. Return the aligned address as a pointer
-        todo!()
+        let mut next = self.next.load(Ordering::SeqCst);
+        loop {
+            let Some(aligned) = next
+                .checked_add(layout.align() - 1)
+                .map(|value| value & !(layout.align() - 1))
+            else {
+                return null_mut();
+            };
+            let Some(end) = aligned.checked_add(layout.size()) else {
+                return null_mut();
+            };
+            if end > self.heap_end {
+                return null_mut();
+            }
+            match self
+                .next
+                .compare_exchange(next, end, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return aligned as *mut u8,
+                Err(actual) => next = actual,
+            }
+        }
     }
 
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
@@ -166,5 +176,38 @@ mod tests {
             p1, p2,
             "address after reset should match the first allocation"
         );
+    }
+
+    #[test]
+    fn test_concurrent_allocations_are_disjoint() {
+        let mut heap = vec![0u8; 32_768];
+        let start = heap.as_mut_ptr() as usize;
+        let allocator = unsafe { BumpAllocator::new(start, start + heap.len()) };
+        let mut addresses = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let allocator = &allocator;
+                    scope.spawn(move || {
+                        (0..100)
+                            .map(|_| {
+                                let address = unsafe {
+                                    allocator.alloc(Layout::from_size_align(16, 16).unwrap())
+                                } as usize;
+                                assert!(address >= start && address + 16 <= start + 32_768);
+                                assert_eq!(address % 16, 0);
+                                address
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        addresses.sort_unstable();
+        assert_eq!(addresses.len(), 800);
+        assert!(addresses.windows(2).all(|pair| pair[0] + 16 <= pair[1]));
     }
 }
